@@ -261,6 +261,8 @@ pub struct Upscaler {
     even_reserved: HashMap<PathBuf, u64>,
     /// Each model's memory use, measured from its engines (see yosh-image's `tiles::Budget`).
     memory: HashMap<PathBuf, MemoryUse>,
+    /// Models libaji's native probe found to build TensorRT engines (not probed again).
+    not_native: std::collections::HashSet<PathBuf>,
     /// Pages picked so far, for the fitted engines' least-recently-used order.
     clock: u64,
     /// The largest fitted tile area by the GPU's size, for a libaji that can't report memory.
@@ -358,6 +360,7 @@ impl Upscaler {
                         even: HashMap::new(),
                         even_reserved: HashMap::new(),
                         memory: HashMap::new(),
+                        not_native: Default::default(),
                         clock: 0,
                         area_budget: tiles::area_budget(device.vram_bytes),
                         cache_dir: cache_dir.clone(),
@@ -464,6 +467,25 @@ impl Upscaler {
         self.memory.insert(path.to_path_buf(), m);
     }
 
+    /// Before `path`'s first tile decision with nothing measured or recorded: if libaji (0.29.0)
+    /// would run it on native kernels, note the memory its probe reports, here and in the record,
+    /// so its tiles are sized from that rather than the TensorRT guess. Models that would build
+    /// an engine keep the guess.
+    fn probe_native(&mut self, path: &Path) {
+        if self.memory_use(path).is_some() || self.not_native.contains(path) {
+            return;
+        }
+        let params = LoadParams { tile: Some((FALLBACK, FALLBACK)), ..LoadParams::new(path) };
+        let Some(m) = self.ctx.native_probe(&params).and_then(|mem| MemoryUse::probed(&mem, (FALLBACK, FALLBACK))) else {
+            self.not_native.insert(path.to_path_buf());
+            return;
+        };
+        if let (Some(dir), Some(file)) = (self.record_dir(path), path.file_name()) {
+            tiles::tiles::record_memory(&dir, &file.to_string_lossy(), self.backend.label(), &self.device.name, &m);
+        }
+        self.memory.insert(path.to_path_buf(), m);
+    }
+
     /// `path`'s memory use as measured this run or recorded by an earlier one.
     fn memory_use(&self, path: &Path) -> Option<MemoryUse> {
         self.memory.get(path).copied().or_else(|| {
@@ -479,7 +501,7 @@ impl Upscaler {
             mem: self.ctx.memory(),
             reserved: reserved(self.device.id),
             area_budget: self.area_budget,
-            use_: self.memory_use(path).unwrap_or_else(|| MemoryUse::guess_for(self.device.compute_capability)),
+            use_: self.memory_use(path).unwrap_or_else(MemoryUse::guess),
         }
     }
 
@@ -492,6 +514,7 @@ impl Upscaler {
             return t;
         }
         let _deciding = LOAD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        self.probe_native(path);
         let budget = self.budget(path);
         let t = tiles::tiles::even_tile(|t| budget.fits((t, t), page).0);
         let bytes = budget.fits((t, t), page).1;
@@ -514,6 +537,9 @@ impl Upscaler {
             return if t > 0 { Pick { even: true, auto: true, ..Pick::tile((t, t)) } } else { square };
         }
         let page = (path.to_path_buf(), (w, h));
+        if !self.shapes.contains_key(&page) {
+            self.probe_native(path);
+        }
         let fitted = match self.shapes.get(&page) {
             Some(&f) => f,
             // decided once the model's memory use is known: from the square's engine after its
