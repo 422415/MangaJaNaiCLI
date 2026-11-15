@@ -858,11 +858,14 @@ fn ensure_runtime(aji_dir: &Path) -> Result<bool, String> {
     }
 }
 
-/// libaji in `aji_dir` loads TensorRT and the models from the shared pack store when setup put
-/// `aji-runtime.json` beside it: stop early when the store's folder is missing (a moved store on
-/// an unplugged drive), with how to fix it, instead of a missing-runtime error later.
+/// libaji in `aji_dir` loads TensorRT and the models from the folders `aji-runtime.json` beside it
+/// names (the shared pack store, or an app copy's own store): stop early when one is missing (a
+/// moved store on an unplugged drive), with how to fix it, instead of a missing-runtime error later.
 fn check_store(aji_dir: &Path) -> Result<(), String> {
-    if aji_dir.join("aji-runtime.json").is_file() { crate::store::check_available() } else { Ok(()) }
+    if !aji_dir.join("aji-runtime.json").is_file() {
+        return Ok(());
+    }
+    crate::store::check_runtime(aji_dir, &crate::store::root()?)
 }
 
 fn upscale(flags: Flags) -> Result<i32, String> {
