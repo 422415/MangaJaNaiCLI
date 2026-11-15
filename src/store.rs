@@ -83,6 +83,45 @@ pub fn check_available() -> Result<(), String> {
     }
 }
 
+/// The pack folders `aji-runtime.json` in `aji_dir` names (TensorRT, its builder resources,
+/// TensorRT-RTX, the models), relative ones resolved against `aji_dir` as libaji does. None when
+/// the file isn't there or can't be read.
+pub fn runtime_dirs(aji_dir: &Path) -> Option<Vec<PathBuf>> {
+    let text = std::fs::read_to_string(aji_dir.join("aji-runtime.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let mut dirs = Vec::new();
+    for key in ["trt", "trt_builder", "trtrtx", "models"] {
+        match &v[key] {
+            serde_json::Value::String(s) => dirs.push(s.as_str()),
+            serde_json::Value::Array(a) => dirs.extend(a.iter().filter_map(|x| x.as_str())),
+            _ => {}
+        }
+    }
+    Some(dirs.into_iter().map(|s| if Path::new(s).is_absolute() { PathBuf::from(s) } else { aji_dir.join(s) }).collect())
+}
+
+/// Before libaji loads from `aji_dir`: when a folder its `aji-runtime.json` names is missing, why,
+/// instead of a missing-runtime error later. Only the folders this copy uses count, so a GUI copy
+/// that keeps its runtime inside itself still runs while the shared store's drive is unplugged.
+/// `shared` is the per-user store's default path.
+pub fn check_runtime(aji_dir: &Path, shared: &Path) -> Result<(), String> {
+    let Some(dirs) = runtime_dirs(aji_dir) else {
+        // unreadable: libaji reports it
+        return Ok(());
+    };
+    let Some(gone) = dirs.iter().find(|d| !d.is_dir()) else {
+        return Ok(());
+    };
+    if let Some(m) = missing(shared).filter(|_| aji_runtime::paths::inside(gone, shared)) {
+        return Err(m);
+    }
+    Err(format!(
+        "the GPU runtime folder {} (named in {}) isn't there. Is its drive connected? Otherwise set the runtime up again (`mangajanai setup`, or in MangaJaNai GUI, App Settings > Storage).",
+        gone.display(),
+        aji_dir.join("aji-runtime.json").display()
+    ))
+}
+
 /// `store location`'s output for the store at `root`.
 pub fn location_text(root: &Path, json: bool) -> String {
     let loc = location::location(root);
@@ -312,6 +351,71 @@ mod tests {
         assert_eq!(location::location(&root), Location::Default);
         assert!(missing(&root).is_none());
         assert!(dir.join("unplugged").join("packs").is_dir(), "reset never touches the folder");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_runtime_json(aji_dir: &Path, v: serde_json::Value) {
+        std::fs::create_dir_all(aji_dir).unwrap();
+        std::fs::write(aji_dir.join("aji-runtime.json"), serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn runtime_dirs_resolve_relative_paths_against_the_aji_folder() {
+        let dir = temp("dirs");
+        let aji = dir.join("app");
+        assert!(runtime_dirs(&aji).is_none());
+        let abs = dir.join("abs-trt");
+        write_runtime_json(
+            &aji,
+            serde_json::json!({"format": 1, "trt": abs.to_string_lossy(), "trt_builder": ["runtime/packs/b/1", "runtime/packs/b/2"],
+                               "trtrtx": "../rtx", "models": ["runtime/packs/m/1"], "other": "ignored"}),
+        );
+        assert_eq!(
+            runtime_dirs(&aji).unwrap(),
+            vec![abs, aji.join("runtime/packs/b/1"), aji.join("runtime/packs/b/2"), aji.join("../rtx"), aji.join("runtime/packs/m/1")]
+        );
+        std::fs::write(aji.join("aji-runtime.json"), b"not json").unwrap();
+        assert!(runtime_dirs(&aji).is_none());
+        assert!(check_runtime(&aji, &dir.join("aji")).is_ok(), "an unreadable file is libaji's to report");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A GUI copy that keeps its runtime inside itself: the shared store's drive being unplugged
+    /// doesn't matter to it; its own folder going missing does.
+    #[test]
+    fn only_the_folders_this_copy_uses_count() {
+        let dir = temp("copy");
+        let shared = dir.join("aji");
+        store_at(&shared);
+        run_lines(&shared, &Command::Move(dir.join("drive"))).0.unwrap();
+        std::fs::rename(dir.join("drive"), dir.join("unplugged")).unwrap();
+        assert!(missing(&shared).is_some());
+
+        let copy = dir.join("portable");
+        let own = copy.join("runtime/packs/trt/1");
+        std::fs::create_dir_all(&own).unwrap();
+        write_runtime_json(&copy, serde_json::json!({"format": 1, "trt": "runtime/packs/trt/1"}));
+        check_runtime(&copy, &shared).unwrap();
+
+        std::fs::remove_dir_all(copy.join("runtime")).unwrap();
+        let e = check_runtime(&copy, &shared).unwrap_err();
+        assert!(e.contains("isn't there. Is its drive connected?") && e.contains("runtime"), "{e}");
+        assert!(!e.contains("store reset"), "not the shared store's message: {e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_runtime_in_the_unplugged_shared_store_says_so() {
+        let dir = temp("shared");
+        let shared = dir.join("aji");
+        store_at(&shared);
+        run_lines(&shared, &Command::Move(dir.join("drive"))).0.unwrap();
+        let app = dir.join("app");
+        write_runtime_json(&app, serde_json::json!({"format": 1, "trt": shared.join("packs/trt/1").to_string_lossy()}));
+        check_runtime(&app, &shared).unwrap();
+        std::fs::rename(dir.join("drive"), dir.join("unplugged")).unwrap();
+        let e = check_runtime(&app, &shared).unwrap_err();
+        assert!(e.contains("shared runtime's folder") && e.contains("mangajanai store reset"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
