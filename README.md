@@ -25,6 +25,9 @@ The command is `mangajanai`. The same program is MangaJaNai GUI's upscaling back
   trick, denoised and un-premultiplied.
 - Engines are built once per model, tile size and GPU, and cached; tiles are sized to the GPU's free
   memory. Several GPUs, or several streams on one, share the work.
+- On RTX 30 series and newer, supported models run on native GPU kernels instead of an engine, with
+  nothing to build. Each run says which models do (`Native kernels: <model>`) and why any other
+  doesn't. `AJI_NATIVE=off` turns them off.
 
 ## Install
 

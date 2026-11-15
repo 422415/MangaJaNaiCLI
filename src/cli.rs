@@ -965,6 +965,7 @@ fn bench(flags: Flags) -> Result<i32, String> {
 
     progress::set_human(true, None);
     let mut up = Upscaler::open(&aji_dir, backend, id, default_cache_dir(flags.cache_dir.clone()), models_dirs(&flags, None, &aji_dir), flags.overlap, flags.even_tiles.unwrap_or(false))?;
+    up.note_native_off();
     let path = up.resolve(&model).ok_or_else(|| format!("model not found: {model}"))?;
     let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
     let what = format!("{name} on {}: {w}x{h} {}", up.description, if flags.gray { "gray" } else { "RGB" });

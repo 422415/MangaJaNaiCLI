@@ -399,6 +399,16 @@ impl Upscaler {
         }
     }
 
+    /// Say (once a run) that native kernels are off, if `AJI_NATIVE` turns them off and the
+    /// backend has them (not DirectML). With them on, each model's load reports its own status.
+    pub fn note_native_off(&self) {
+        if self.backend != Backend::DirectMl
+            && let Some(value) = native_off()
+        {
+            progress::native_off(&value, backend_name(self.backend));
+        }
+    }
+
     /// A chain's model file (see [`resolve_in`]).
     pub fn resolve(&self, model: &str) -> Option<PathBuf> {
         resolve_in(model, &self.model_dirs)
@@ -649,7 +659,13 @@ impl Upscaler {
         }
         let params = LoadParams { onnx: &key.0, tile: Some(key.1), overlap: self.overlap, async_build: true, even_tiles: false };
         let _loading = LOAD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        match self.ctx.load_model(&params) {
+        let loaded = self.ctx.load_model(&params);
+        if let Ok(model) = &loaded
+            && model.state() != ModelState::Failed
+        {
+            note_native(&self.ctx, self.backend, &key.0);
+        }
+        match loaded {
             Ok(model) => match model.state() {
                 ModelState::Building => {
                     progress::fitted_engine(name, &label, self.backend.label(), false);
@@ -921,10 +937,74 @@ fn open_context(aji: &Aji, backend: Backend, device_id: u64, cache_dir: &Option<
         trtexec_env: trtexec.1.clone(),
         log: Some(std::sync::Arc::new(|level, msg| {
             if level <= 2 {
-                progress::backend_log(msg);
+                // a native probe's answer that a model builds an engine, which libaji logs as an
+                // error: the model's load reports it as its native status
+                if probe_refusal(msg).is_none() {
+                    progress::backend_log(msg);
+                }
+            } else if let Some(n) = native_message(msg) {
+                progress::native(n);
             }
         })),
     })
+}
+
+/// libaji's info line about a model and the native kernels (its image path, `aji_img_load`):
+/// `native kernels: <model> (<what>)` when the model runs on them, `native kernels not used for
+/// <model>: <why>; using <TensorRT or TensorRT-RTX>` when it builds an engine instead. `<model>` is
+/// the ONNX file's stem.
+fn native_message(msg: &str) -> Option<progress::Native<'_>> {
+    if let Some(rest) = msg.strip_prefix("native kernels not used for ") {
+        let (model, rest) = rest.split_once(": ")?;
+        let (why, using) = rest.rsplit_once("; using ").unwrap_or((rest, "TensorRT"));
+        return Some(progress::Native::Unused { model, why, using });
+    }
+    let rest = msg.strip_prefix("native kernels: ")?;
+    Some(match rest.strip_suffix(')').and_then(|r| r.split_once(" (")) {
+        Some((model, what)) => progress::Native::Used { model, what },
+        None => progress::Native::Used { model: rest, what: "" },
+    })
+}
+
+/// `AJI_NATIVE`'s value when it turns libaji's native kernels off (`off`, `0`, `no`, `false`, as
+/// libaji reads it), else `None`.
+fn native_off_value(value: Option<&str>) -> Option<&str> {
+    value.filter(|v| matches!(*v, "off" | "0" | "no" | "false"))
+}
+
+/// The `AJI_NATIVE` value turning native kernels off for this process, if any.
+fn native_off() -> Option<String> {
+    let v = std::env::var("AJI_NATIVE").ok()?;
+    native_off_value(Some(&v)).map(str::to_string)
+}
+
+/// After `path` loaded on `ctx`: if libaji said nothing about native kernels for it, it is a model
+/// libaji doesn't try on them (one channel, a fixed input size), reported as not used with the
+/// reason libaji's probe gives, so every model of a run has a status. Nothing on DirectML (no
+/// native kernels) or with them off (said once at the start).
+fn note_native(ctx: &Context, backend: Backend, path: &Path) {
+    if backend == Backend::DirectMl || native_off().is_some() {
+        return;
+    }
+    let model = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    if progress::native_reported(&model) {
+        return;
+    }
+    let params = LoadParams { tile: Some((FALLBACK, FALLBACK)), ..LoadParams::new(path) };
+    let why = match ctx.native_probe(&params) {
+        Some(_) => return, // a load would run it on them (libaji said so, unless it's older)
+        None => probe_refusal(&ctx.last_error()).unwrap_or("not a model the native kernels run").to_string(),
+    };
+    progress::native(progress::Native::Unused { model: &model, why: &why, using: backend.label() });
+}
+
+/// The reason in libaji's probe error for a model it doesn't try on native kernels:
+/// `<model>: not for native kernels (<why>)` or `<model>: native kernels not used: <why>`.
+fn probe_refusal(err: &str) -> Option<&str> {
+    if let Some((_, why)) = err.split_once(": not for native kernels (") {
+        return why.strip_suffix(')');
+    }
+    err.split_once(": native kernels not used: ").map(|(_, why)| why)
 }
 
 /// Load `path` at `tile` on `ctx`, waiting out a background engine build (reported on stdout).
@@ -942,6 +1022,7 @@ fn load_model(ctx: &Context, backend: Backend, path: &Path, tile: Shape, overlap
     if model.state() == ModelState::Failed {
         return Err(ctx.last_error());
     }
+    note_native(ctx, backend, path);
     Ok(model)
 }
 
@@ -1012,6 +1093,61 @@ fn hint_device(aji_dir: &Path, choice: BackendChoice, device_id: u64) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_messages_are_parsed() {
+        let used = |m| match native_message(m) {
+            Some(progress::Native::Used { model, what }) => Some((model, what)),
+            _ => None,
+        };
+        let unused = |m| match native_message(m) {
+            Some(progress::Native::Unused { model, why, using }) => Some((model, why, using)),
+            _ => None,
+        };
+        assert_eq!(
+            used("native kernels: 2x_IllustrationJaNai_V3denoise_FDAT_M_unshuffle_30k_fp16 (FDAT 2x, 4 groups x 3 blocks, 96 channels, 4 heads, 8x8 windows (shifted))"),
+            Some((
+                "2x_IllustrationJaNai_V3denoise_FDAT_M_unshuffle_30k_fp16",
+                "FDAT 2x, 4 groups x 3 blocks, 96 channels, 4 heads, 8x8 windows (shifted)"
+            ))
+        );
+        assert_eq!(used("native kernels: m"), Some(("m", "")));
+        assert_eq!(
+            unused("native kernels not used for 4x_Model: no kernel for op GridSample; using TensorRT-RTX"),
+            Some(("4x_Model", "no kernel for op GridSample", "TensorRT-RTX"))
+        );
+        assert_eq!(
+            unused("native kernels not used for 4x_Model: out of memory for the tile buffers; using TensorRT"),
+            Some(("4x_Model", "out of memory for the tile buffers", "TensorRT"))
+        );
+        assert_eq!(unused("native kernels not used for m: why"), Some(("m", "why", "TensorRT")));
+        for other in [
+            "building TensorRT engine for m (512x512)",
+            "removed stale engine x",
+            "native kernels failed: x",
+            "m: model changed since its engine was built, rebuilding",
+        ] {
+            assert!(native_message(other).is_none(), "{other}");
+        }
+    }
+
+    #[test]
+    fn native_off_values() {
+        for v in ["off", "0", "no", "false"] {
+            assert_eq!(native_off_value(Some(v)), Some(v));
+        }
+        for v in [None, Some("on"), Some("1"), Some(""), Some("OFF")] {
+            assert_eq!(native_off_value(v), None, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn probe_refusals() {
+        assert_eq!(probe_refusal("m: not for native kernels (not 3-channel)"), Some("not 3-channel"));
+        assert_eq!(probe_refusal("m: not for native kernels (fixed input size)"), Some("fixed input size"));
+        assert_eq!(probe_refusal("m: native kernels not used: tile size not accepted"), Some("tile size not accepted"));
+        assert_eq!(probe_refusal("something else"), None);
+    }
 
     #[test]
     fn uniform_alpha_is_detected() {
