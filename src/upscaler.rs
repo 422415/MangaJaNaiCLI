@@ -479,7 +479,7 @@ impl Upscaler {
             mem: self.ctx.memory(),
             reserved: reserved(self.device.id),
             area_budget: self.area_budget,
-            use_: self.memory_use(path).unwrap_or_else(MemoryUse::guess),
+            use_: self.memory_use(path).unwrap_or_else(|| MemoryUse::guess_for(self.device.compute_capability)),
         }
     }
 
