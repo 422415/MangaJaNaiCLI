@@ -11,7 +11,9 @@ MangaJaNaiCLI: one Rust program under two names (`src/cli.rs::main`):
   as `mangajanai_upscale.exe` with `--settings appstate2.json --aji-dir --backend --cache-dir
   --models-dir x2 [--device <id>]`, plus `--list-devices` and `--model-info` for queries. It reads
   the stdout line protocol in `progress.rs` (`PROGRESS=`, `TOTALZIP=`, `ENGINE_BUILD`, `ENGINE_READY`,
-  `BACKEND_FALLBACK`, `HINT`, `ERROR`).
+  `BACKEND_FALLBACK`, `HINT`, `ERROR`, and since 0.9.2 `NATIVE <model>: <what>`, `NATIVE_UNUSED
+  <model>: <why>` and `NATIVE_OFF`: whether each model runs on libaji's native kernels, once per model
+  a run, `<model>` being the ONNX file's stem; nothing on DirectML).
   **This interface is a contract: don't change the exe name, the flags the GUI passes, or a line of
   the protocol.** Check a change by running the same `appstate2.json` through the old and new
   binaries and comparing stdout and output digests (cbz entries compare by name/CRC; zip timestamps

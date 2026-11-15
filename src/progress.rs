@@ -2,9 +2,12 @@
 //!
 //! - **Lines** (the default, and always with `--settings`): the stdout protocol MangaJaNaiConverterGui
 //!   reads. The `PROGRESS=` and `TOTALZIP=` lines are the ones the 1.x Python backend printed, so the
-//!   GUI's progress bars work unchanged; everything else is a log line for its console.
+//!   GUI's progress bars work unchanged; everything else is a log line for its console. The GUI
+//!   also reads `ENGINE_BUILD`, `ENGINE_READY`, `BACKEND_FALLBACK`, `HINT`, `PAUSED` and the
+//!   native-kernel lines `NATIVE`, `NATIVE_UNUSED` and `NATIVE_OFF` ([`Native`], [`native_off`]).
 //! - **Human** (the command line): a progress bar with rate and ETA on stderr, notices for engine
-//!   builds, fallbacks and errors, per-file detail only with `--verbose`, and a summary at the end.
+//!   builds, fallbacks, native kernels and errors, per-file detail only with `--verbose`, and a
+//!   summary at the end.
 
 use std::io::{IsTerminal, Write};
 use std::sync::{Mutex, OnceLock};
@@ -231,8 +234,83 @@ pub fn backend_fallback(model: Option<&str>, why: &str, instead: &str) {
     }
 }
 
-/// A model's precision is suboptimal for the backend and GPU it runs on (`precision::hint`):
-/// printed once per model file, before it loads. The GUI shows it as a non-blocking notice.
+/// Whether a model runs on libaji's native GPU kernels (TensorRT and TensorRT-RTX; DirectML has
+/// none), once per model a run: `NATIVE <model>: <what>` or `NATIVE_UNUSED <model>: <why>` (the
+/// model builds an engine instead), `<model>` being the ONNX file's stem; on the command line
+/// "Native kernels: ..." / "Native kernels not used for ...". With native kernels off
+/// (`AJI_NATIVE=off`), one `NATIVE_OFF` instead and nothing per model.
+pub enum Native<'a> {
+    Used { model: &'a str, what: &'a str },
+    Unused { model: &'a str, why: &'a str, using: &'a str },
+}
+
+/// The models whose [`Native`] status was reported this run.
+static NATIVE_SEEN: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+static NATIVE_OFF_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Note `model`'s status as reported; false if it already was.
+fn native_first(model: &str) -> bool {
+    NATIVE_SEEN.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert_default().insert(model.to_string())
+}
+
+/// Whether `model`'s [`Native`] status was reported this run.
+pub fn native_reported(model: &str) -> bool {
+    NATIVE_SEEN.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|s| s.contains(model))
+}
+
+/// One line of text: libaji's reasons never span lines, but the protocol is line based.
+fn one_line(s: &str) -> String {
+    s.split(['\r', '\n']).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ")
+}
+
+/// The command line's message for `n`.
+fn native_human(n: &Native) -> String {
+    match n {
+        Native::Used { model, what: "" } => format!("Native kernels: {model}"),
+        Native::Used { model, what } => format!("Native kernels: {model} ({})", one_line(what)),
+        Native::Unused { model, why, using } => format!("Native kernels not used for {model}: {}; using {using}", one_line(why)),
+    }
+}
+
+/// The protocol line for `n`.
+fn native_line(n: &Native) -> String {
+    match n {
+        Native::Used { model, what: "" } => format!("NATIVE {model}"),
+        Native::Used { model, what } => format!("NATIVE {model}: {}", one_line(what)),
+        Native::Unused { model, why, .. } => format!("NATIVE_UNUSED {model}: {}", one_line(why)),
+    }
+}
+
+pub fn native(n: Native) {
+    let model = match &n {
+        Native::Used { model, .. } | Native::Unused { model, .. } => *model,
+    };
+    if !native_first(model) {
+        return;
+    }
+    match human() {
+        Some(mut h) => h.say(&native_human(&n)),
+        None => line(&native_line(&n)),
+    }
+}
+
+/// The command line's message for native kernels turned off by `AJI_NATIVE=<value>`, on `backend`.
+fn native_off_human(value: &str, backend: &str) -> String {
+    format!("Native kernels are off (AJI_NATIVE={value}): every model builds a {backend} engine. Unset AJI_NATIVE to use them.")
+}
+
+/// Native kernels are off for this run (`AJI_NATIVE`, set to `value`), on a backend that has
+/// them: said once.
+pub fn native_off(value: &str, backend: &str) {
+    if NATIVE_OFF_SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    match human() {
+        Some(mut h) => h.say(&native_off_human(value, backend)),
+        None => line("NATIVE_OFF"),
+    }
+}
+
 /// The run let go of the GPU after a pause request (`--control stdin`'s `PAUSE`).
 pub fn paused() {
     match human() {
@@ -248,6 +326,8 @@ pub fn resumed() {
     }
 }
 
+/// A model's precision is suboptimal for the backend and GPU it runs on (`precision::hint`):
+/// printed once per model file, before it loads. The GUI shows it as a non-blocking notice.
 pub fn hint(model: &str, text: &str) {
     match human() {
         Some(mut h) => h.say(&format!("note: {model}: {text}")),
@@ -351,5 +431,35 @@ pub fn finish(elapsed: Duration) -> u64 {
             line(&format!("Elapsed time: {:.2} seconds", elapsed.as_secs_f64()));
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_messages() {
+        let used = Native::Used { model: "2x_Model_fp16", what: "ESRGAN 2x, 23 RRDB, 64 features, growth 32" };
+        assert_eq!(native_line(&used), "NATIVE 2x_Model_fp16: ESRGAN 2x, 23 RRDB, 64 features, growth 32");
+        assert_eq!(native_human(&used), "Native kernels: 2x_Model_fp16 (ESRGAN 2x, 23 RRDB, 64 features, growth 32)");
+        let bare = Native::Used { model: "m", what: "" };
+        assert_eq!((native_line(&bare).as_str(), native_human(&bare).as_str()), ("NATIVE m", "Native kernels: m"));
+        let unused = Native::Unused { model: "4x_Other", why: "unsupported op\nGridSample", using: "TensorRT-RTX" };
+        assert_eq!(native_line(&unused), "NATIVE_UNUSED 4x_Other: unsupported op GridSample");
+        assert_eq!(native_human(&unused), "Native kernels not used for 4x_Other: unsupported op GridSample; using TensorRT-RTX");
+        assert_eq!(
+            native_off_human("off", "TensorRT"),
+            "Native kernels are off (AJI_NATIVE=off): every model builds a TensorRT engine. Unset AJI_NATIVE to use them."
+        );
+    }
+
+    #[test]
+    fn native_status_is_reported_once_per_model() {
+        assert!(!native_reported("progress-test-model"));
+        assert!(native_first("progress-test-model"));
+        assert!(native_reported("progress-test-model"));
+        assert!(!native_first("progress-test-model"));
+        assert!(!native_reported("progress-test-other"));
     }
 }

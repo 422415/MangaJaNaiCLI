@@ -729,6 +729,7 @@ pub fn run(inputs: Vec<Input>, output: Output, job: Job, upscalers: Vec<OpenUpsc
                     match open() {
                         Ok(u) => {
                             progress::info(&format!("Upscaling with {}", u.description));
+                            u.note_native_off();
                             up = Some(u);
                         }
                         Err(e) => {
