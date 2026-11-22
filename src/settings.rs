@@ -55,6 +55,9 @@ pub struct Workflow {
     pub upscale_archives: bool,
     pub overwrite_existing_files: bool,
     pub lossy_compression_quality: Option<i32>,
+    /// JPEG XL: set the distance (`JxlDistance`) instead of the quality.
+    pub use_jxl_distance: bool,
+    pub jxl_distance: Option<f64>,
     pub use_lossless_compression: bool,
     pub chains: Values<Chain>,
 }
@@ -84,6 +87,8 @@ impl Default for Workflow {
             upscale_archives: true,
             overwrite_existing_files: false,
             lossy_compression_quality: Some(80),
+            use_jxl_distance: false,
+            jxl_distance: Some(1.0),
             use_lossless_compression: false,
             chains: Values::default(),
         }
@@ -222,6 +227,12 @@ impl Workflow {
     pub fn quality(&self) -> u8 {
         self.lossy_compression_quality.unwrap_or(80).clamp(0, 100) as u8
     }
+
+    /// The JPEG XL distance, when the workflow sets one instead of the quality.
+    pub fn distance(&self) -> Option<f32> {
+        let d = self.jxl_distance.filter(|d| d.is_finite()).unwrap_or(1.0);
+        self.use_jxl_distance.then(|| d.clamp(0.0, crate::encode::MAX_DISTANCE as f64) as f32)
+    }
 }
 
 impl AppState {
@@ -275,6 +286,17 @@ mod tests {
         assert_eq!(w.format().ext(), "jxl");
         let old: Workflow = serde_json::from_str(r#"{"WebpSelected": false, "AvifSelected": true}"#).unwrap();
         assert_eq!(old.format(), Format::Avif, "a workflow without JxlSelected reads as before");
+    }
+
+    #[test]
+    fn jxl_distance_only_when_chosen() {
+        let w = |j: &str| serde_json::from_str::<Workflow>(j).unwrap().distance();
+        assert_eq!(w(r#"{"JxlSelected": true, "LossyCompressionQuality": 95}"#), None, "older workflows use the quality");
+        assert_eq!(w(r#"{"UseJxlDistance": false, "JxlDistance": 0.5}"#), None);
+        assert_eq!(w(r#"{"UseJxlDistance": true, "JxlDistance": 0.5}"#), Some(0.5));
+        assert_eq!(w(r#"{"UseJxlDistance": true, "JxlDistance": null}"#), Some(1.0));
+        assert_eq!(w(r#"{"UseJxlDistance": true, "JxlDistance": 40}"#), Some(25.0));
+        assert_eq!(w(r#"{"UseJxlDistance": true, "JxlDistance": -1}"#), Some(0.0));
     }
 
     #[test]
