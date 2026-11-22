@@ -59,6 +59,8 @@ Size (default: the model's own scale):
 
 Saving:
   --format webp|png|jpg|avif|jxl   (default webp)    -q, --quality <0-100>   (default 80)
+  --distance <0-25>         jxl only, in place of -q: JPEG XL's distance (cjxl's -d); lower is
+                            better, 1 is about q90, 0 is lossless
   --lossless                lossless webp or jxl
   --suffix <text>           appended to file names    --filename <template>   %filename% = input name
   --skip-existing           keep outputs that exist (default)    --overwrite   redo them
@@ -158,6 +160,7 @@ struct Flags {
     target: Option<Target>,
     format: Option<Format>,
     quality: Option<u8>,
+    distance: Option<f32>,
     lossless: Option<bool>,
     filename: Option<String>,
     suffix: Option<String>,
@@ -198,6 +201,16 @@ struct Flags {
 
 fn num<T: std::str::FromStr>(name: &str, v: &str) -> Result<T, String> {
     v.trim().parse().map_err(|_| format!("{name}: '{v}' is not a valid number"))
+}
+
+/// The quality and the JPEG XL distance from (quality, distance) pairs, nearest source first (the
+/// flags, the config file, a workflow). A distance replaces a quality from its own source or a
+/// farther one, and a quality from a nearer source replaces the distance: `-q 95` overrides the
+/// file's `distance =`.
+fn quality_and_distance(sources: [(Option<u8>, Option<f32>); 3]) -> (u8, Option<f32>) {
+    let quality = sources.iter().find_map(|s| s.0).unwrap_or(80).min(100);
+    let distance = sources.iter().find_map(|&(q, d)| d.map(Some).or(q.map(|_| None))).flatten();
+    (quality, distance)
 }
 
 fn parse_flags(args: Vec<String>) -> Result<Flags, String> {
@@ -247,6 +260,13 @@ fn parse_flags(args: Vec<String>) -> Result<Flags, String> {
             "--native" => f.target = Some(Target::Native),
             "--format" => f.format = Some(config::parse_format(&value(&key)?)?),
             "-q" | "--quality" => f.quality = Some(num::<u8>(&key, &value(&key)?)?.min(100)),
+            "--distance" => {
+                let d: f32 = num(&key, &value(&key)?)?;
+                if !(0.0..=crate::encode::MAX_DISTANCE).contains(&d) {
+                    return Err(format!("{key} must be from 0 to 25, like 1 or 0.5"));
+                }
+                f.distance = Some(d);
+            }
             "--lossless" => f.lossless = Some(true),
             "--suffix" => f.suffix = Some(value(&key)?),
             "--filename" => f.filename = Some(value(&key)?),
@@ -458,6 +478,7 @@ fn gui_run(flags: Flags) -> i32 {
         target: wf.target(),
         format: wf.format(),
         quality: wf.quality(),
+        distance: wf.distance(),
         lossless: wf.use_lossless_compression,
     };
 
@@ -750,12 +771,18 @@ fn resolve(flags: &Flags) -> Result<Plan, String> {
         Some(s) => Some(config::parse_format(s)?),
         None => None,
     };
+    let (quality, distance) = quality_and_distance([
+        (flags.quality, flags.distance),
+        file.map_or((None, None), |f| (f.save.quality, f.save.distance)),
+        wf.as_ref().map_or((None, None), |w| (Some(w.quality()), w.distance())),
+    ]);
     let job = process::Job {
         chains,
         threshold: flags.gray_threshold.or(file.and_then(|f| f.gray_threshold)).or(wf.as_ref().map(|w| w.grayscale_detection_threshold)).unwrap_or(12),
         target,
         format: flags.format.or(file_format).or(wf.as_ref().map(|w| w.format())).unwrap_or(Format::Webp),
-        quality: flags.quality.or(file.and_then(|f| f.save.quality)).or(wf.as_ref().map(|w| w.quality())).unwrap_or(80).min(100),
+        quality,
+        distance,
         lossless: flags.lossless.or(file.and_then(|f| f.save.lossless)).or(wf.as_ref().map(|w| w.use_lossless_compression)).unwrap_or(false),
     };
 
@@ -1046,6 +1073,22 @@ mod tests {
         assert_eq!(f.models_dirs, [PathBuf::from("m")]);
         assert!(parse_flags(vec!["--bogus".into()]).is_err());
         assert!(parse_flags(vec!["--lossless=yes".into()]).is_err(), "a switch takes no value");
+        assert_eq!(flags(&["--distance", "0.5"]).distance, Some(0.5));
+        assert_eq!(flags(&["--distance=0"]).distance, Some(0.0));
+        for bad in ["26", "-1", "NaN", "fine"] {
+            assert!(parse_flags(vec!["--distance".into(), bad.into()]).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn nearer_quality_or_distance_wins() {
+        let none = (None, None);
+        assert_eq!(quality_and_distance([none, none, none]), (80, None));
+        assert_eq!(quality_and_distance([none, (Some(90), Some(0.5)), none]), (90, Some(0.5)), "the file's distance");
+        assert_eq!(quality_and_distance([(Some(95), None), (Some(90), Some(0.5)), none]), (95, None), "-q beats the file's distance");
+        assert_eq!(quality_and_distance([(None, Some(2.0)), (Some(90), Some(0.5)), none]), (90, Some(2.0)));
+        assert_eq!(quality_and_distance([none, (Some(90), None), (Some(80), Some(0.5))]), (90, None), "the file's quality beats a workflow's distance");
+        assert_eq!(quality_and_distance([none, none, (Some(80), Some(0.5))]), (80, Some(0.5)));
     }
 
     #[test]

@@ -11,16 +11,21 @@ pub struct Out {
     pub pixels: Vec<u8>,
 }
 
-pub fn encode(img: &Out, format: Format, quality: u8, lossless: bool) -> Result<Vec<u8>, String> {
+/// `distance` is JPEG XL's own setting (libjxl's Butteraugli distance, cjxl's `-d`); it replaces
+/// `quality` for jxl when set, and the other formats ignore it.
+pub fn encode(img: &Out, format: Format, quality: u8, distance: Option<f32>, lossless: bool) -> Result<Vec<u8>, String> {
     match format {
         Format::Png => png(img),
         Format::Jpeg => jpeg(img, quality),
         Format::Webp => webp(img, quality, lossless),
         Format::Avif => avif(img, quality),
         #[cfg(feature = "jxl")]
-        Format::Jxl => jxl(img, quality, lossless),
+        Format::Jxl => jxl(img, quality, distance, lossless),
         #[cfg(not(feature = "jxl"))]
-        Format::Jxl => Err("jxl: this build has no JPEG XL encoder (built without the `jxl` feature)".into()),
+        Format::Jxl => {
+            let _ = distance;
+            Err("jxl: this build has no JPEG XL encoder (built without the `jxl` feature)".into())
+        }
     }
 }
 
@@ -109,9 +114,28 @@ fn avif(img: &Out, quality: u8) -> Result<Vec<u8>, String> {
     res.map(|r| r.avif_file).map_err(|e| format!("avif: {e}"))
 }
 
+/// The largest JPEG XL distance libjxl takes (cjxl's -d range is 0 to 25).
+pub const MAX_DISTANCE: f32 = 25.0;
+
+/// libjxl's `JxlEncoderDistanceFromQuality` (what cjxl's -q uses): 100 is 0 (lossless), 90 is 1.0,
+/// and from 30 to 99 it falls on a line, 0.19 at 99 to 6.4 at 30.
+pub fn distance_from_quality(quality: u8) -> f32 {
+    let q = quality.min(100) as f32;
+    if q >= 100.0 {
+        0.0
+    } else if q >= 30.0 {
+        0.1 + (100.0 - q) * 0.09
+    } else {
+        53.0 / 3000.0 * q * q - 23.0 / 20.0 * q + 25.0
+    }
+}
+
 /// JPEG XL through libjxl, one thread per image (the batch already encodes several at once).
 /// Gray stays one channel and alpha is kept. `quality` maps to libjxl's distance as cjxl's -q
-/// does; `lossless` is true lossless, which needs the original (sRGB) profile instead of XYB.
+/// does, unless `distance` is given. `lossless` is true lossless, which needs the original (sRGB)
+/// profile instead of XYB. Distance 0, which quality 100 maps to, is lossless too: libjxl switches
+/// such a frame to lossless and would refuse it with the XYB profile (cjxl's -q 100 and -d 0 are
+/// lossless the same way).
 ///
 /// Effort (libjxl's default is 7), measured on upscaled manga pages (3000x4500 gray and color,
 /// 1520x2400), one thread per page: lossy, effort 5 matches effort 7 in size and SSIMULACRA2 (within
@@ -119,15 +143,17 @@ fn avif(img: &Out, quality: u8) -> Result<Vec<u8>, String> {
 /// (q80: 3% smaller, +1.5 SSIMULACRA2); effort 3 is 5x faster but worse than WebP. Lossless,
 /// effort 7 is 9% smaller than effort 5 (and than lossless WebP) for 1.8x the time.
 #[cfg(feature = "jxl")]
-fn jxl(img: &Out, quality: u8, lossless: bool) -> Result<Vec<u8>, String> {
+fn jxl(img: &Out, quality: u8, distance: Option<f32>, lossless: bool) -> Result<Vec<u8>, String> {
     use jpegxl_rs::encode::{ColorEncoding, EncoderFrame, EncoderSpeed};
+    let distance = distance.unwrap_or_else(|| distance_from_quality(quality));
+    let lossless = lossless || distance <= 0.0;
     let mut enc = jpegxl_rs::encoder_builder()
         .has_alpha(img.channels % 2 == 0)
         .color_encoding(if img.channels <= 2 { ColorEncoding::SrgbLuma } else { ColorEncoding::Srgb })
         .lossless(lossless)
         .uses_original_profile(lossless)
         .speed(if lossless { EncoderSpeed::Squirrel } else { EncoderSpeed::Hare })
-        .jpeg_quality(quality as f32)
+        .quality(if lossless { 0.0 } else { distance.min(MAX_DISTANCE) })
         .build()
         .map_err(|e| format!("jxl: {e}"))?;
     let frame = EncoderFrame::new(&img.pixels[..]).num_channels(img.channels as u32);
@@ -146,11 +172,11 @@ mod tests {
     #[test]
     fn too_large_for_webp_is_an_error() {
         let img = Out { w: WEBP_MAX + 1, h: 1, channels: 1, pixels: vec![0; WEBP_MAX as usize + 1] };
-        let err = encode(&img, Format::Webp, 80, false).unwrap_err();
+        let err = encode(&img, Format::Webp, 80, None, false).unwrap_err();
         assert!(err.contains("larger than WebP allows"), "{err}");
         let img = Out { w: WEBP_MAX, h: 1, channels: 1, pixels: vec![0; WEBP_MAX as usize] };
-        assert!(encode(&img, Format::Webp, 80, false).is_ok());
-        assert!(encode(&img, Format::Webp, 80, true).is_ok());
+        assert!(encode(&img, Format::Webp, 80, None, false).is_ok());
+        assert!(encode(&img, Format::Webp, 80, None, true).is_ok());
     }
 
     fn img(channels: u8) -> Out {
@@ -163,17 +189,17 @@ mod tests {
     fn every_format_and_layout_encodes() {
         for ch in 1..=4 {
             let i = img(ch);
-            let png_bytes = encode(&i, Format::Png, 80, false).unwrap();
+            let png_bytes = encode(&i, Format::Png, 80, None, false).unwrap();
             assert!(png_bytes.starts_with(b"\x89PNG"));
             let decoded = yosh_image::decode::decode(&png_bytes).unwrap();
             assert_eq!((decoded.w, decoded.h), (16, 8));
-            assert!(encode(&i, Format::Jpeg, 80, false).unwrap().starts_with(&[0xFF, 0xD8]));
-            assert!(&encode(&i, Format::Webp, 80, false).unwrap()[8..12] == b"WEBP");
-            assert!(&encode(&i, Format::Webp, 80, true).unwrap()[8..12] == b"WEBP");
-            assert!(&encode(&i, Format::Avif, 80, false).unwrap()[4..8] == b"ftyp");
+            assert!(encode(&i, Format::Jpeg, 80, None, false).unwrap().starts_with(&[0xFF, 0xD8]));
+            assert!(&encode(&i, Format::Webp, 80, None, false).unwrap()[8..12] == b"WEBP");
+            assert!(&encode(&i, Format::Webp, 80, None, true).unwrap()[8..12] == b"WEBP");
+            assert!(&encode(&i, Format::Avif, 80, None, false).unwrap()[4..8] == b"ftyp");
             #[cfg(feature = "jxl")]
             for lossless in [false, true] {
-                let jxl = encode(&i, Format::Jxl, 80, lossless).unwrap();
+                let jxl = encode(&i, Format::Jxl, 80, None, lossless).unwrap();
                 assert!(yosh_image::decode::is_jxl(&jxl));
                 let d = yosh_image::decode::decode(&jxl).unwrap();
                 assert_eq!((d.w, d.h), (16, 8));
@@ -181,16 +207,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn distance_follows_libjxl() {
+        assert_eq!(distance_from_quality(100), 0.0);
+        assert!((distance_from_quality(90) - 1.0).abs() < 1e-6);
+        assert!((distance_from_quality(99) - 0.19).abs() < 1e-6);
+        assert!((distance_from_quality(0) - 25.0).abs() < 1e-6);
+    }
+
+    /// Quality 100 and distance 0 are lossless (issue: libjxl refused quality 100 as lossless
+    /// with the XYB profile); a distance replaces the quality.
+    #[cfg(feature = "jxl")]
+    #[test]
+    fn jxl_quality_100_and_distance_0_are_lossless() {
+        for ch in [1, 3, 4] {
+            let i = img(ch);
+            let want = encode(&i, Format::Jxl, 80, None, true).unwrap();
+            assert_eq!(encode(&i, Format::Jxl, 100, None, false).unwrap(), want, "q100, {ch} channels");
+            assert_eq!(encode(&i, Format::Jxl, 80, Some(0.0), false).unwrap(), want, "d0, {ch} channels");
+        }
+        let i = img(3);
+        let fine = encode(&i, Format::Jxl, 10, Some(0.5), false).unwrap();
+        let coarse = encode(&i, Format::Jxl, 100, Some(5.0), false).unwrap();
+        assert!(yosh_image::decode::is_jxl(&fine) && yosh_image::decode::is_jxl(&coarse));
+        assert_ne!(fine, coarse, "the distance, not the quality, sets the result");
+        assert_eq!(encode(&i, Format::Jxl, 90, None, false).unwrap(), encode(&i, Format::Jxl, 0, Some(1.0), false).unwrap());
+    }
+
     /// yosh-image decodes gray as 1 channel and color (with or without alpha) as RGBA.
     #[cfg(feature = "jxl")]
     #[test]
     fn lossless_jxl_round_trips_exactly() {
         let gray = img(1);
-        let d = yosh_image::decode::decode(&encode(&gray, Format::Jxl, 80, true).unwrap()).unwrap();
+        let d = yosh_image::decode::decode(&encode(&gray, Format::Jxl, 80, None, true).unwrap()).unwrap();
         assert_eq!((d.channels, &d.pixels), (1, &gray.pixels));
         for ch in [3, 4] {
             let i = img(ch);
-            let d = yosh_image::decode::decode(&encode(&i, Format::Jxl, 80, true).unwrap()).unwrap();
+            let d = yosh_image::decode::decode(&encode(&i, Format::Jxl, 80, None, true).unwrap()).unwrap();
             assert_eq!(d.channels, 4);
             let opaque = |p: &[u8]| if ch == 4 { p.to_vec() } else { vec![p[0], p[1], p[2], 255] };
             let want: Vec<u8> = i.pixels.chunks_exact(ch as usize).flat_map(opaque).collect();
@@ -201,7 +254,7 @@ mod tests {
     #[test]
     fn png_round_trips_gray_exactly() {
         let i = img(1);
-        let d = yosh_image::decode::decode(&encode(&i, Format::Png, 80, false).unwrap()).unwrap();
+        let d = yosh_image::decode::decode(&encode(&i, Format::Png, 80, None, false).unwrap()).unwrap();
         assert_eq!(d.channels, 1);
         assert_eq!(d.pixels, i.pixels);
     }

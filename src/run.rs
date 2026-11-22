@@ -842,7 +842,7 @@ mod tests {
 
     fn job() -> Job {
         use crate::settings::{Format, Target};
-        Job { chains: Vec::new(), threshold: 12, target: Target::Native, format: Format::Webp, quality: 80, lossless: false }
+        Job { chains: Vec::new(), threshold: 12, target: Target::Native, format: Format::Webp, quality: 80, distance: None, lossless: false }
     }
 
     #[test]

@@ -18,6 +18,8 @@ pub struct Job {
     pub target: Target,
     pub format: Format,
     pub quality: u8,
+    /// JPEG XL's distance, in place of `quality` for jxl.
+    pub distance: Option<f32>,
     pub lossless: bool,
 }
 
@@ -171,7 +173,7 @@ pub fn finish(work: Work, job: &Job, name: &str, resizer: &mut Resizer) -> Resul
         };
         (fw, fh) = (tw, th);
     }
-    encode::encode(&Out { w: fw, h: fh, channels, pixels }, job.format, job.quality, job.lossless)
+    encode::encode(&Out { w: fw, h: fh, channels, pixels }, job.format, job.quality, job.distance, job.lossless)
 }
 
 #[cfg(test)]
@@ -186,7 +188,7 @@ mod tests {
             model_file_path: "No Model".into(),
             ..Chain::default()
         };
-        Job { chains: vec![chain], threshold: 12, target, format: Format::Png, quality: 80, lossless: false }
+        Job { chains: vec![chain], threshold: 12, target, format: Format::Png, quality: 80, distance: None, lossless: false }
     }
 
     fn size_after(job: &Job) -> (u32, u32) {
@@ -195,7 +197,7 @@ mod tests {
 
     fn size_of(job: &Job, (w, h): (u32, u32)) -> (u32, u32) {
         let page = Out { w, h, channels: 1, pixels: vec![128; (w * h) as usize] };
-        let bytes = encode::encode(&page, Format::Png, 80, false).unwrap();
+        let bytes = encode::encode(&page, Format::Png, 80, None, false).unwrap();
         let mut resizer = Resizer::new();
         let work = prepare(&bytes, job, "page", &mut resizer).unwrap();
         let out = decode::decode(&finish(work, job, "page", &mut resizer).unwrap()).unwrap();

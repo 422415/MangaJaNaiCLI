@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::encode::MAX_DISTANCE;
 use crate::settings::{Chain, Format, Target};
 use crate::tiles::Tile;
 
@@ -36,6 +37,9 @@ folder = out
 format = webp
 ; Lossy quality, 0-100 (webp, jpg, avif, jxl).
 quality = 90
+; jxl only, in place of quality: JPEG XL's distance, 0-25 (cjxl's -d). Lower is better: 1 is about
+; quality 90, 0.5 about 95.5, 0 is lossless. Leave empty to use quality.
+distance =
 ; Lossless webp or jxl (yes or no).
 lossless = no
 ; Added to each file name: page01 -> page01_x4.webp. Leave empty for none.
@@ -140,6 +144,7 @@ pub struct File {
 pub struct Save {
     pub format: Option<String>,
     pub quality: Option<u8>,
+    pub distance: Option<f32>,
     pub lossless: Option<bool>,
     pub suffix: Option<String>,
     pub filename: Option<String>,
@@ -380,12 +385,16 @@ impl File {
                     if f.save.quality.is_some_and(|q| q > 100) {
                         return Err("[output] quality should be a number from 0 to 100".into());
                     }
+                    f.save.distance = r.number::<f32>("distance", "a number from 0 to 25, like 1 or 0.5")?;
+                    if f.save.distance.is_some_and(|d| !(0.0..=MAX_DISTANCE).contains(&d)) {
+                        return Err("[output] distance should be a number from 0 to 25, like 1 or 0.5".into());
+                    }
                     f.save.lossless = r.switch("lossless")?;
                     f.save.suffix = r.string("suffix")?;
                     f.save.filename = r.string("filename")?;
                     f.save.skip_existing = r.switch("skip_existing")?;
                     f.save.workers = r.number("workers", "a number like 8 or 16")?;
-                    r.finish(&["folder", "format", "quality", "lossless", "suffix", "filename", "skip_existing", "workers"])?;
+                    r.finish(&["folder", "format", "quality", "distance", "lossless", "suffix", "filename", "skip_existing", "workers"])?;
                 }
                 "model" => {
                     f.model = r.string("file")?;
@@ -550,6 +559,7 @@ mod tests {
         assert_eq!(f.input, ["in"]);
         assert_eq!(f.output.as_deref(), Some("out"));
         assert_eq!(f.save.quality, Some(90));
+        assert_eq!(f.save.distance, None, "empty = use quality");
         assert_eq!(f.save.lossless, Some(false));
         assert_eq!(f.save.suffix, None, "empty = not set");
         assert_eq!(f.save.workers, None, "empty = the default");
@@ -594,6 +604,11 @@ workers = many
         assert!(err("quality = 3").contains("before any [section]"));
         assert!(err("[output]\nlossless = maybe").contains("yes or no"));
         assert!(err("[output]\nquality = high").contains("line 2"));
+        assert!(err("[output]\ndistance = fine").contains("line 2"));
+        assert!(err("[output]\ndistance = 30").contains("0 to 25"));
+        assert!(err("[output]\ndistance = -1").contains("0 to 25"));
+        assert!(err("[output]\ndistance = NaN").contains("0 to 25"));
+        assert_eq!(File::parse("[output]\ndistance = 0.5").unwrap().save.distance, Some(0.5));
         assert!(err("[output]\nformat = gif").contains("webp, png, jpg, avif or jxl"));
         assert!(err("[output]\nformat = png\nformat = jpg").contains("set twice"));
         assert!(err("[output]\n[output]").contains("appears twice"));

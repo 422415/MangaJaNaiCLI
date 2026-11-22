@@ -19,8 +19,8 @@ The command is `mangajanai`. The same program is MangaJaNai GUI's upscaling back
   WebP, TIFF) are upscaled upright.
 - One model for everything, MangaJaNai's per-page rules (gray pages by height, color pages), your own
   rules, or a workflow exported from MangaJaNai GUI.
-- Resize after the model to a scale, width, height or a box; webp or jxl (lossy/lossless), png, jpg,
-  avif.
+- Resize after the model to a scale, width, height or a box; webp or jxl (lossy/lossless, jxl by
+  quality or distance), png, jpg, avif.
 - Transparency: uniform alpha is kept as is; varying alpha is recovered with the black/white two-pass
   trick, denoised and un-premultiplied.
 - Engines are built once per model, tile size and GPU, and cached; tiles are sized to the GPU's free
