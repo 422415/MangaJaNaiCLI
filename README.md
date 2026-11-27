@@ -121,10 +121,13 @@ mangajanai bench 2x_model.onnx --tile 512 --iters 20
 - **Tile size** (`--tile`, `[gpu] tile`) is one engine per model and tile. The default, `auto`,
   sizes tiles to the GPU's free memory (counting what other programs use), from what each model
   was measured to need:
-  - On TensorRT each model gets one engine that splits any page into the fewest even tiles of up
-    to 1024 (768 or 512 when memory is short). On an RTX 5090 with MangaJaNai ESRGAN 2x, a
-    1200x1800 page took 165 ms against 253 on 512, and ten pages of mixed sizes 36% less time;
-    with ESRGAN 4x, 780 ms against 1109. Larger tiles weren't faster.
+  - On TensorRT each model splits the page into the fewest even tiles of up to 1024 (768 or
+    512 when memory is short). For pages larger than 1024, models running on native kernels
+    can use 1536 or 2048. The model at that tile size plus the page's tiling scratch must fit
+    in a quarter of the GPU and in free memory after other workers' reservations and headroom.
+    Striped ESRGAN uses a larger tile only if it can hold the whole page: moving a join can
+    change the phase of generated screentone. A later page can change the choice. Each worker
+    keeps one auto tile size loaded per model.
   - On TensorRT-RTX and DirectML, where that kind of engine is slow or missing, pages run on 512,
     and a page size that keeps coming up (a volume, from its second or third page) gets an engine
     fitted to it, built in the background. With MangaJaNai ESRGAN 2x on 1200x1800 pages (RTX
