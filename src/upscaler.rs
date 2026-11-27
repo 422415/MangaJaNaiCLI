@@ -104,27 +104,40 @@ struct EvenTile {
     size: u32,
     /// Upper end of the last page-size range. None once this run is on a fixed fallback.
     checked: Option<u32>,
-    /// Striped ESRGAN: only change its grid when the entire page fits in one tile.
+    /// A larger tile for this model is worthwhile only if it holds the whole page.
     whole_page: bool,
 }
 
-/// libaji 0.33 allocates a model during a probe. Screen full-tile models against the budget
-/// before probing a larger square, then reserve the exact result including the page scratch.
+/// Striped models can shift screentone phase at a new join. A partial 4x transformer
+/// promotion also costs several GiB for little end-to-end benefit.
+fn needs_whole_page(scale: u32, striped: bool) -> bool {
+    striped || scale >= 4
+}
+
+/// Screen a candidate using the model/GPU memory record (or the ordinary first 512 probe).
+/// Full-output models grow with tile area. Strip buffers grow more slowly, so use only
+/// their known minimum until libaji measures that precise tile.
+fn native_tile_estimate(page: Shape, t: u32, use_: MemoryUse) -> Option<u64> {
+    let full_io = 6 * (1 + u64::from(use_.scale).pow(2));
+    let striped = use_.buffers_per_px != full_io as f64;
+    if needs_whole_page(use_.scale, striped) && page.0.max(page.1) > t {
+        return None;
+    }
+    let model = if striped { use_.weights + 6 * u64::from(t).pow(2) } else { use_.added((t, t), page, 0, 0) };
+    Some(model + scratch(page, t, use_.scale))
+}
+
+/// libaji 0.33 allocates a model during a probe. First rule out impossible promotions
+/// from data auto mode already has, then reserve the exact result including page scratch.
 fn big_native_tile(page: Shape, candidates: &[u32], budget: &Budget, mut probe: impl FnMut(Shape) -> Option<Memory>) -> Option<(u32, u64, bool)> {
-    candidates.first()?;
-    // The output buffer of a striped ESRGAN holds only one strip, so it cannot give the scale
-    // at a large tile. Probe no taller than one strip, even with the libaji comparison override.
-    let rows = std::env::var("AJI_IMG_TAIL_ROWS").ok().and_then(|s| s.parse::<i32>().ok())
-        .filter(|&n| n > 0).map_or(32, |n| n.min(32) as u32);
-    let reference = (256, rows);
-    let small = probe(reference)?;
-    let scale = MemoryUse::probed(&small, reference)?.scale;
-    let full_io = 6 * (1 + u64::from(scale).pow(2)); // fp16 RGB input and full output per input pixel
-    if small.model_buffers != u64::from(reference.0) * u64::from(rows) * full_io {
+    let &largest = candidates.first()?;
+    // Even a stale engine record carries its measured output scale. No 4x layout may
+    // promote this page if the largest candidate still leaves a join.
+    if budget.use_.scale >= 4 && page.0.max(page.1) > largest {
         return None;
     }
     let use_ = if budget.use_.shared {
-        // A cache entry from an engine run cannot predict this native model's allocations.
+        // A record from a TensorRT engine run cannot predict a native model's allocations.
         let tile = (FALLBACK, FALLBACK);
         MemoryUse::probed(&probe(tile)?, tile)?
     } else {
@@ -133,27 +146,32 @@ fn big_native_tile(page: Shape, candidates: &[u32], budget: &Budget, mut probe: 
     let fits = |bytes, m: &Memory| {
         bytes <= m.device_total / 4 && fits_memory(bytes, m.device_free.saturating_sub(budget.reserved), m.device_total)
     };
+    if !candidates.iter().any(|&t| {
+        native_tile_estimate(page, t, use_).is_some_and(|bytes| budget.mem.is_none_or(|m| fits(bytes, &m)))
+    }) {
+        return None;
+    }
+    // A striped output buffer can understate scale in a record made by an older probe.
+    // Only pay for a short, full-height reference if a candidate survived the cheap checks.
+    let rows = std::env::var("AJI_IMG_TAIL_ROWS").ok().and_then(|s| s.parse::<i32>().ok())
+        .filter(|&n| n > 0).map_or(32, |n| n.min(32) as u32);
+    let reference = (256, rows);
+    let small = probe(reference)?;
+    let scale = MemoryUse::probed(&small, reference)?.scale;
+    let full_io = 6 * (1 + u64::from(scale).pow(2));
+    if small.model_buffers != u64::from(reference.0) * u64::from(rows) * full_io {
+        return None;
+    }
     candidates.iter().copied().find_map(|t| {
-        let whole = page.0.max(page.1) <= t;
-        let scratch = scratch(page, t, scale);
-        let model = if use_.buffers_per_px == full_io as f64 {
-            use_.added((t, t), page, 0, 0)
-        } else {
-            // Changing a still-tiled ESRGAN grid moves the phase of generated screentone.
-            if !whole {
-                return None;
-            }
-            // A strip's working set grows more slowly than the tile area. Only screen the
-            // known minimum (weights and fp16 input); ask libaji for the actual footprint.
-            small.model_weights + 6 * u64::from(t).pow(2)
-        };
-        if !fits(model + scratch, &small) {
+        if !fits(native_tile_estimate(page, t, MemoryUse { scale, ..use_ })?, &small) {
             return None;
         }
         let mem = probe((t, t))?;
-        let bytes = mem.model_weights + mem.model_activations + mem.model_buffers + scratch;
-        let striped = mem.model_buffers < full_io * u64::from(t).pow(2);
-        (fits(bytes, &mem) && (!striped || whole)).then_some((t, bytes, striped))
+        let bytes = mem.model_weights + mem.model_activations + mem.model_buffers + scratch(page, t, scale);
+        // The earlier geometry check avoids an allocation. Check the actual layout too:
+        // the cached record can describe another tile or an earlier native setting.
+        let whole_page = needs_whole_page(scale, mem.model_buffers < full_io * u64::from(t).pow(2));
+        (fits(bytes, &mem) && (!whole_page || page.0.max(page.1) <= t)).then_some((t, bytes, whole_page))
     })
 }
 
@@ -1207,19 +1225,52 @@ mod tests {
     }
 
     #[test]
-    fn full_tile_model_skips_an_over_budget_probe() {
-        let page = (1131, 1600);
-        let probe = |(w, h): Shape| {
-            assert!(w <= 1536, "2048 would allocate over a quarter of the device");
-            let area = u64::from(w) * u64::from(h);
-            Some(Memory { device_total: 32 << 30, device_free: 32 << 30,
-                model_weights: 10 << 20, model_activations: area * 2300, model_buffers: area * 102, ..Memory::default() })
+    fn impossible_promotions_skip_every_extra_probe() {
+        let device = Memory { device_total: 32 << 30, device_free: 32 << 30, ..Memory::default() };
+        let mut budget = Budget {
+            mem: Some(device), reserved: 0, area_budget: 0,
+            use_: MemoryUse { weights: 32 << 20, activations_per_px: 364.0, buffers_per_px: 12.0, shared: false, scale: 2 },
         };
-        let use_ = MemoryUse::probed(&probe((512, 512)).unwrap(), (512, 512)).unwrap();
-        let budget = Budget { mem: None, reserved: 0, area_budget: 0, use_ };
-        let (tile, _, whole_page) = big_native_tile(page, &big_tiles_for(page), &budget, probe).unwrap();
-        assert_eq!(tile, 1536);
-        assert!(!whole_page);
+        let tall = (1131, 2160);
+        assert_eq!(big_native_tile(tall, &big_tiles_for(tall), &budget, |_| panic!("oversize striped page probed")), None);
+
+        // The recorded full-output 4x model cannot afford 2048, and 1536 still splits this page.
+        budget.use_ = MemoryUse { weights: 10 << 20, activations_per_px: 2300.0, buffers_per_px: 102.0, shared: false, scale: 4 };
+        let page = (1131, 1600);
+        assert_eq!(big_native_tile(page, &big_tiles_for(page), &budget, |_| panic!("no affordable whole tile")), None);
+
+        // The same 1536 tile pays when it removes the last join.
+        let landscape = (1200, 1000);
+        let pick = big_native_tile(landscape, &big_tiles_for(landscape), &budget, |(w, h)| {
+            let area = u64::from(w) * u64::from(h);
+            Some(Memory { model_weights: 10 << 20, model_activations: 2300 * area, model_buffers: 102 * area, ..device })
+        });
+        assert!(matches!(pick, Some((1536, _, true))));
+    }
+
+    #[test]
+    fn exact_native_footprint_is_limited_to_one_quarter() {
+        let page = (1131, 1600);
+        let t = 2048;
+        let total = 32_u64 << 30;
+        let cap = 8_u64 << 30;
+        let device = Memory { device_total: total, device_free: total, ..Memory::default() };
+        let budget = Budget {
+            mem: Some(device), reserved: 0, area_budget: 0,
+            use_: MemoryUse { weights: 32 << 20, activations_per_px: 300.0, buffers_per_px: 30.0, shared: false, scale: 2 },
+        };
+        let pick = |required: u64| big_native_tile(page, &[t], &budget, |(w, h)| {
+            let model_buffers = 30 * u64::from(w) * u64::from(h);
+            let model_weights = budget.use_.weights;
+            let model_activations = if w == t {
+                required - model_weights - model_buffers - scratch(page, t, 2)
+            } else {
+                1 << 20
+            };
+            Some(Memory { model_weights, model_buffers, model_activations, ..device })
+        });
+        assert_eq!(pick(cap), Some((t, cap, false)));
+        assert_eq!(pick(cap + 1), None);
     }
 
     #[test]

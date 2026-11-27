@@ -125,9 +125,11 @@ mangajanai bench 2x_model.onnx --tile 512 --iters 20
     512 when memory is short). For pages larger than 1024, models running on native kernels
     can use 1536 or 2048. The model at that tile size plus the page's tiling scratch must fit
     in a quarter of the GPU and in free memory after other workers' reservations and headroom.
-    Striped ESRGAN uses a larger tile only if it can hold the whole page: moving a join can
-    change the phase of generated screentone. A later page can change the choice. Each worker
-    keeps one auto tile size loaded per model.
+    Striped ESRGAN and full-output models at 4× or higher take a larger tile only when it holds
+    the entire page. Moving a join can shift ESRGAN’s generated screentone. For 4× FDAT-M the
+    last join made the difference in a 64-page JPEG run. The existing per-model/GPU memory
+    record rules out unsuitable probes before libaji allocates them. Each worker keeps one auto
+    tile size loaded per model and can reconsider it for a later page.
   - On TensorRT-RTX and DirectML, where that kind of engine is slow or missing, pages run on 512,
     and a page size that keeps coming up (a volume, from its second or third page) gets an engine
     fitted to it, built in the background. With MangaJaNai ESRGAN 2x on 1200x1800 pages (RTX
